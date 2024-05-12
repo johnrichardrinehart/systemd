@@ -2933,461 +2933,466 @@ static int save_env(void) {
 }
 
 int main(int argc, char *argv[]) {
-        dual_timestamp
-                initrd_timestamp = DUAL_TIMESTAMP_NULL,
-                userspace_timestamp = DUAL_TIMESTAMP_NULL,
-                kernel_timestamp = DUAL_TIMESTAMP_NULL,
-                security_start_timestamp = DUAL_TIMESTAMP_NULL,
-                security_finish_timestamp = DUAL_TIMESTAMP_NULL;
-        struct rlimit saved_rlimit_nofile = RLIMIT_MAKE_CONST(0),
-                saved_rlimit_memlock = RLIMIT_MAKE_CONST(RLIM_INFINITY); /* The original rlimits we passed
-                                                                          * in. Note we use different values
-                                                                          * for the two that indicate whether
-                                                                          * these fields are initialized! */
-        bool skip_setup, loaded_policy = false, queue_default_job = false, first_boot = false;
-        char *switch_root_dir = NULL, *switch_root_init = NULL;
-        usec_t before_startup, after_startup;
-        static char systemd[] = "systemd";
-        const char *error_message = NULL;
-        int r, retval = EXIT_FAILURE;
-        Manager *m = NULL;
-        FDSet *fds = NULL;
-
-        assert_se(argc > 0 && !isempty(argv[0]));
-
-        /* SysV compatibility: redirect init → telinit */
-        redirect_telinit(argc, argv);
-
-        /* Take timestamps early on */
-        dual_timestamp_from_monotonic(&kernel_timestamp, 0);
-        dual_timestamp_now(&userspace_timestamp);
-
-        /* Figure out whether we need to do initialize the system, or if we already did that because we are
-         * reexecuting. */
-        skip_setup = early_skip_setup_check(argc, argv);
-
-        /* If we get started via the /sbin/init symlink then we are called 'init'. After a subsequent
-         * reexecution we are then called 'systemd'. That is confusing, hence let's call us systemd
-         * right-away. */
-        program_invocation_short_name = systemd;
-        (void) prctl(PR_SET_NAME, systemd);
-
-        /* Save the original command line */
-        save_argc_argv(argc, argv);
-
-        /* Save the original environment as we might need to restore it if we're requested to execute another
-         * system manager later. */
-        r = save_env();
-        if (r < 0) {
-                error_message = "Failed to copy environment block";
-                goto finish;
-        }
-
-        /* Make sure that if the user says "syslog" we actually log to the journal. */
-        log_set_upgrade_syslog_to_journal(true);
-
-        if (getpid_cached() == 1) {
-                /* When we run as PID 1 force system mode */
-                arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
-
-                /* Disable the umask logic */
-                umask(0);
-
-                /* Make sure that at least initially we do not ever log to journald/syslogd, because it might
-                 * not be activated yet (even though the log socket for it exists). */
-                log_set_prohibit_ipc(true);
-
-                /* Always reopen /dev/console when running as PID 1 or one of its pre-execve() children. This
-                 * is important so that we never end up logging to any foreign stderr, for example if we have
-                 * to log in a child process right before execve()'ing the actual binary, at a point in time
-                 * where socket activation stderr/stdout area already set up. */
-                log_set_always_reopen_console(true);
-
-                if (detect_container() <= 0) {
-
-                        /* Running outside of a container as PID 1 */
-                        log_set_target_and_open(LOG_TARGET_KMSG);
-
-                        if (in_initrd())
-                                initrd_timestamp = userspace_timestamp;
-
-                        if (!skip_setup) {
-                                r = mount_setup_early();
-                                if (r < 0) {
-                                        error_message = "Failed to mount early API filesystems";
-                                        goto finish;
-                                }
-                        }
-
-                        /* We might have just mounted /proc, so let's try to parse the kernel
-                         * command line log arguments immediately. */
-                        log_parse_environment();
-
-                        /* Let's open the log backend a second time, in case the first time didn't
-                         * work. Quite possibly we have mounted /dev just now, so /dev/kmsg became
-                         * available, and it previously wasn't. */
-                        log_open();
-
-                        if (!skip_setup) {
-                                disable_printk_ratelimit();
-
-                                r = initialize_security(
-                                                &loaded_policy,
-                                                &security_start_timestamp,
-                                                &security_finish_timestamp,
-                                                &error_message);
-                                if (r < 0)
-                                        goto finish;
-                        }
-
-                        if (mac_init() < 0) {
-                                error_message = "Failed to initialize MAC support";
-                                goto finish;
-                        }
-
-                        if (!skip_setup)
-                                initialize_clock();
-
-                        /* Set the default for later on, but don't actually open the logs like this for
-                         * now. Note that if we are transitioning from the initrd there might still be
-                         * journal fd open, and we shouldn't attempt opening that before we parsed
-                         * /proc/cmdline which might redirect output elsewhere. */
-                        log_set_target(LOG_TARGET_JOURNAL_OR_KMSG);
-
-                } else {
-                        /* Running inside a container, as PID 1 */
-                        log_set_target_and_open(LOG_TARGET_CONSOLE);
-
-                        /* For later on, see above... */
-                        log_set_target(LOG_TARGET_JOURNAL);
-
-                        /* clear the kernel timestamp, because we are in a container */
-                        kernel_timestamp = DUAL_TIMESTAMP_NULL;
-                }
-
-                initialize_coredump(skip_setup);
-
-                r = fixup_environment();
-                if (r < 0) {
-                        log_struct_errno(LOG_EMERG, r,
-                                         LOG_MESSAGE("Failed to fix up PID 1 environment: %m"),
-                                         "MESSAGE_ID=" SD_MESSAGE_CORE_PID1_ENVIRONMENT_STR);
-                        error_message = "Failed to fix up PID1 environment";
-                        goto finish;
-                }
-
-                /* Try to figure out if we can use colors with the console. No need to do that for user
-                 * instances since they never log into the console. */
-                log_show_color(colors_enabled());
-
-                r = make_null_stdio();
-                if (r < 0)
-                        log_warning_errno(r, "Failed to redirect standard streams to /dev/null, ignoring: %m");
-
-                /* Load the kernel modules early. */
-                if (!skip_setup)
-                        (void) kmod_setup();
-
-                /* Mount /proc, /sys and friends, so that /proc/cmdline and /proc/$PID/fd is available. */
-                r = mount_setup(loaded_policy, skip_setup);
-                if (r < 0) {
-                        error_message = "Failed to mount API filesystems";
-                        goto finish;
-                }
-
-                if (!skip_setup) {
-                        /* Before we actually start deleting cgroup v1 code, make it harder to boot
-                         * in cgroupv1 mode first. See also #30852. */
-
-                        r = mount_cgroup_legacy_controllers(loaded_policy);
-                        if (r < 0) {
-                                if (r == -ERFKILL)
-                                        error_message = "Refusing to run under cgroup v1, SYSTEMD_CGROUP_ENABLE_LEGACY_FORCE=1 not specified on kernel command line";
-                                else
-                                        error_message = "Failed to mount cgroup v1 hierarchy";
-                                goto finish;
-                        }
-                        if (r > 0) {
-                                log_full(LOG_CRIT, "Legacy cgroup v1 support selected. This is no longer supported. Will proceed anyway after 30s.");
-                                (void) usleep_safe(30 * USEC_PER_SEC);
-                        }
-                }
-
-                /* The efivarfs is now mounted, let's lock down the system token. */
-                lock_down_efi_variables();
-
-                /* Cache command-line options passed from EFI variables */
-                if (!skip_setup)
-                        (void) cache_efi_options_variable();
-        } else {
-                /* Running as user instance */
-                arg_runtime_scope = RUNTIME_SCOPE_USER;
-                log_set_always_reopen_console(true);
-                log_set_target_and_open(LOG_TARGET_AUTO);
-
-                /* clear the kernel timestamp, because we are not PID 1 */
-                kernel_timestamp = DUAL_TIMESTAMP_NULL;
-
-                /* Clear ambient capabilities, so services do not inherit them implicitly. Dropping them does
-                 * not affect the permitted and effective sets which are important for the manager itself to
-                 * operate. */
-                capability_ambient_set_apply(0, /* also_inherit= */ false);
-
-                if (mac_init() < 0) {
-                        error_message = "Failed to initialize MAC support";
-                        goto finish;
-                }
-        }
-
-        /* Save the original RLIMIT_NOFILE/RLIMIT_MEMLOCK so that we can reset it later when
-         * transitioning from the initrd to the main systemd or suchlike. */
-        save_rlimits(&saved_rlimit_nofile, &saved_rlimit_memlock);
-
-        /* Reset all signal handlers. */
-        (void) reset_all_signal_handlers();
-        (void) ignore_signals(SIGNALS_IGNORE);
-
-        (void) parse_configuration(&saved_rlimit_nofile, &saved_rlimit_memlock);
-
-        r = parse_argv(argc, argv);
-        if (r < 0) {
-                error_message = "Failed to parse command line arguments";
-                goto finish;
-        }
-
-        r = safety_checks();
-        if (r < 0)
-                goto finish;
-
-        if (IN_SET(arg_action, ACTION_TEST, ACTION_HELP, ACTION_DUMP_CONFIGURATION_ITEMS, ACTION_DUMP_BUS_PROPERTIES, ACTION_BUS_INTROSPECT))
-                pager_open(arg_pager_flags);
-
-        if (arg_action != ACTION_RUN)
-                skip_setup = true;
-
-        if (arg_action == ACTION_HELP) {
-                retval = help() < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
-                goto finish;
-        } else if (arg_action == ACTION_VERSION) {
-                retval = version();
-                goto finish;
-        } else if (arg_action == ACTION_DUMP_CONFIGURATION_ITEMS) {
-                unit_dump_config_items(stdout);
-                retval = EXIT_SUCCESS;
-                goto finish;
-        } else if (arg_action == ACTION_DUMP_BUS_PROPERTIES) {
-                dump_bus_properties(stdout);
-                retval = EXIT_SUCCESS;
-                goto finish;
-        } else if (arg_action == ACTION_BUS_INTROSPECT) {
-                r = bus_manager_introspect_implementations(stdout, arg_bus_introspect);
-                retval = r >= 0 ? EXIT_SUCCESS : EXIT_FAILURE;
-                goto finish;
-        }
-
-        assert_se(IN_SET(arg_action, ACTION_RUN, ACTION_TEST));
-
-        /* Move out of the way, so that we won't block unmounts */
-        assert_se(chdir("/") == 0);
-
-        if (arg_action == ACTION_RUN) {
-                if (!skip_setup) {
-                        /* Apply the systemd.clock_usec= kernel command line switch */
-                        apply_clock_update();
-
-                        /* Apply random seed from kernel command line */
-                        cmdline_take_random_seed();
-                }
-
-                /* A core pattern might have been specified via the cmdline. */
-                initialize_core_pattern(skip_setup);
-
-                /* Make /usr/ read-only */
-                apply_protect_system(skip_setup);
-
-                /* Close logging fds, in order not to confuse collecting passed fds and terminal logic below */
-                log_close();
-
-                /* Remember open file descriptors for later deserialization */
-                r = collect_fds(&fds, &error_message);
-                if (r < 0)
-                        goto finish;
-
-                /* Give up any control of the console, but make sure its initialized. */
-                setup_console_terminal(skip_setup);
-
-                /* Open the logging devices, if possible and necessary */
-                log_open();
-        }
-
-        log_execution_mode(&first_boot);
-
-        r = initialize_runtime(skip_setup,
-                               first_boot,
-                               &saved_rlimit_nofile,
-                               &saved_rlimit_memlock,
-                               &error_message);
-        if (r < 0)
-                goto finish;
-
-        r = manager_new(arg_runtime_scope,
-                        arg_action == ACTION_TEST ? MANAGER_TEST_FULL : 0,
-                        &m);
-        if (r < 0) {
-                log_struct_errno(LOG_EMERG, r,
-                                 LOG_MESSAGE("Failed to allocate manager object: %m"),
-                                 "MESSAGE_ID=" SD_MESSAGE_CORE_MANAGER_ALLOCATE_STR);
-                error_message = "Failed to allocate manager object";
-                goto finish;
-        }
-
-        m->timestamps[MANAGER_TIMESTAMP_KERNEL] = kernel_timestamp;
-        m->timestamps[MANAGER_TIMESTAMP_INITRD] = initrd_timestamp;
-        m->timestamps[MANAGER_TIMESTAMP_USERSPACE] = userspace_timestamp;
-        m->timestamps[manager_timestamp_initrd_mangle(MANAGER_TIMESTAMP_SECURITY_START)] = security_start_timestamp;
-        m->timestamps[manager_timestamp_initrd_mangle(MANAGER_TIMESTAMP_SECURITY_FINISH)] = security_finish_timestamp;
-
-        set_manager_defaults(m);
-        set_manager_settings(m);
-        manager_set_first_boot(m, first_boot);
-        manager_set_switching_root(m, arg_switched_root);
-
-        /* Remember whether we should queue the default job */
-        queue_default_job = !arg_serialization || arg_switched_root;
-
-        before_startup = now(CLOCK_MONOTONIC);
-
-        r = manager_startup(m, arg_serialization, fds, /* root= */ NULL);
-        if (r < 0) {
-                error_message = "Failed to start up manager";
-                goto finish;
-        }
-
-        /* This will close all file descriptors that were opened, but not claimed by any unit. */
-        fds = fdset_free(fds);
-        arg_serialization = safe_fclose(arg_serialization);
-
-        if (queue_default_job) {
-                r = do_queue_default_job(m, &error_message);
-                if (r < 0)
-                        goto finish;
-        }
-
-        after_startup = now(CLOCK_MONOTONIC);
-
-        log_full(arg_action == ACTION_TEST ? LOG_INFO : LOG_DEBUG,
-                 "Loaded units and determined initial transaction in %s.",
-                 FORMAT_TIMESPAN(after_startup - before_startup, 100 * USEC_PER_MSEC));
-
-        if (arg_action == ACTION_TEST) {
-                manager_test_summary(m);
-                retval = EXIT_SUCCESS;
-                goto finish;
-        }
-
-        r = invoke_main_loop(m,
-                             &saved_rlimit_nofile,
-                             &saved_rlimit_memlock,
-                             &retval,
-                             &fds,
-                             &switch_root_dir,
-                             &switch_root_init,
-                             &error_message);
-        assert(r < 0 || IN_SET(r, MANAGER_EXIT,          /* MANAGER_OK is not expected here. */
-                                  MANAGER_RELOAD,
-                                  MANAGER_REEXECUTE,
-                                  MANAGER_REBOOT,
-                                  MANAGER_SOFT_REBOOT,
-                                  MANAGER_POWEROFF,
-                                  MANAGER_HALT,
-                                  MANAGER_KEXEC,
-                                  MANAGER_SWITCH_ROOT));
+        unsigned kernel_v = __const_min(INT_MAX, ~(size_t)0/sizeof(void *)) & -BITS_PER_LONG;
+        int yuwata_v = CONST_MIN((size_t) INT_MAX, SIZE_MAX / sizeof(void*)) & ~(sizeof(long) * 8 - 1);
+        int YHNdnzj_v = CONST_MIN((size_t) INT_MAX, SIZE_MAX / sizeof(void*)) & -(sizeof(long) * 8 - 1);
+        printf("kernel_v: %d\nyuwata_v: %d\nYHNdnzj_v: %d\n", kernel_v, yuwata_v, YHNdnzj_v);
+        exit 0;
+        //dual_timestamp
+        //        initrd_timestamp = DUAL_TIMESTAMP_NULL,
+        //        userspace_timestamp = DUAL_TIMESTAMP_NULL,
+        //        kernel_timestamp = DUAL_TIMESTAMP_NULL,
+        //        security_start_timestamp = DUAL_TIMESTAMP_NULL,
+        //        security_finish_timestamp = DUAL_TIMESTAMP_NULL;
+        //struct rlimit saved_rlimit_nofile = RLIMIT_MAKE_CONST(0),
+        //        saved_rlimit_memlock = RLIMIT_MAKE_CONST(RLIM_INFINITY); /* The original rlimits we passed
+        //                                                                  * in. Note we use different values
+        //                                                                  * for the two that indicate whether
+        //                                                                  * these fields are initialized! */
+        //bool skip_setup, loaded_policy = false, queue_default_job = false, first_boot = false;
+        //char *switch_root_dir = NULL, *switch_root_init = NULL;
+        //usec_t before_startup, after_startup;
+        //static char systemd[] = "systemd";
+        //const char *error_message = NULL;
+        //int r, retval = EXIT_FAILURE;
+        //Manager *m = NULL;
+        //FDSet *fds = NULL;
+
+        //assert_se(argc > 0 && !isempty(argv[0]));
+
+        ///* SysV compatibility: redirect init → telinit */
+        //redirect_telinit(argc, argv);
+
+        ///* Take timestamps early on */
+        //dual_timestamp_from_monotonic(&kernel_timestamp, 0);
+        //dual_timestamp_now(&userspace_timestamp);
+
+        ///* Figure out whether we need to do initialize the system, or if we already did that because we are
+        // * reexecuting. */
+        //skip_setup = early_skip_setup_check(argc, argv);
+
+        ///* If we get started via the /sbin/init symlink then we are called 'init'. After a subsequent
+        // * reexecution we are then called 'systemd'. That is confusing, hence let's call us systemd
+        // * right-away. */
+        //program_invocation_short_name = systemd;
+        //(void) prctl(PR_SET_NAME, systemd);
+
+        ///* Save the original command line */
+        //save_argc_argv(argc, argv);
+
+        ///* Save the original environment as we might need to restore it if we're requested to execute another
+        // * system manager later. */
+        //r = save_env();
+        //if (r < 0) {
+        //        error_message = "Failed to copy environment block";
+        //        goto finish;
+        //}
+
+        ///* Make sure that if the user says "syslog" we actually log to the journal. */
+        //log_set_upgrade_syslog_to_journal(true);
+
+        //if (getpid_cached() == 1) {
+        //        /* When we run as PID 1 force system mode */
+        //        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+
+        //        /* Disable the umask logic */
+        //        umask(0);
+
+        //        /* Make sure that at least initially we do not ever log to journald/syslogd, because it might
+        //         * not be activated yet (even though the log socket for it exists). */
+        //        log_set_prohibit_ipc(true);
+
+        //        /* Always reopen /dev/console when running as PID 1 or one of its pre-execve() children. This
+        //         * is important so that we never end up logging to any foreign stderr, for example if we have
+        //         * to log in a child process right before execve()'ing the actual binary, at a point in time
+        //         * where socket activation stderr/stdout area already set up. */
+        //        log_set_always_reopen_console(true);
+
+        //        if (detect_container() <= 0) {
+
+        //                /* Running outside of a container as PID 1 */
+        //                log_set_target_and_open(LOG_TARGET_KMSG);
+
+        //                if (in_initrd())
+        //                        initrd_timestamp = userspace_timestamp;
+
+        //                if (!skip_setup) {
+        //                        r = mount_setup_early();
+        //                        if (r < 0) {
+        //                                error_message = "Failed to mount early API filesystems";
+        //                                goto finish;
+        //                        }
+        //                }
+
+        //                /* We might have just mounted /proc, so let's try to parse the kernel
+        //                 * command line log arguments immediately. */
+        //                log_parse_environment();
+
+        //                /* Let's open the log backend a second time, in case the first time didn't
+        //                 * work. Quite possibly we have mounted /dev just now, so /dev/kmsg became
+        //                 * available, and it previously wasn't. */
+        //                log_open();
+
+        //                if (!skip_setup) {
+        //                        disable_printk_ratelimit();
+
+        //                        r = initialize_security(
+        //                                        &loaded_policy,
+        //                                        &security_start_timestamp,
+        //                                        &security_finish_timestamp,
+        //                                        &error_message);
+        //                        if (r < 0)
+        //                                goto finish;
+        //                }
+
+        //                if (mac_init() < 0) {
+        //                        error_message = "Failed to initialize MAC support";
+        //                        goto finish;
+        //                }
+
+        //                if (!skip_setup)
+        //                        initialize_clock();
+
+        //                /* Set the default for later on, but don't actually open the logs like this for
+        //                 * now. Note that if we are transitioning from the initrd there might still be
+        //                 * journal fd open, and we shouldn't attempt opening that before we parsed
+        //                 * /proc/cmdline which might redirect output elsewhere. */
+        //                log_set_target(LOG_TARGET_JOURNAL_OR_KMSG);
+
+        //        } else {
+        //                /* Running inside a container, as PID 1 */
+        //                log_set_target_and_open(LOG_TARGET_CONSOLE);
+
+        //                /* For later on, see above... */
+        //                log_set_target(LOG_TARGET_JOURNAL);
+
+        //                /* clear the kernel timestamp, because we are in a container */
+        //                kernel_timestamp = DUAL_TIMESTAMP_NULL;
+        //        }
+
+        //        initialize_coredump(skip_setup);
+
+        //        r = fixup_environment();
+        //        if (r < 0) {
+        //                log_struct_errno(LOG_EMERG, r,
+        //                                 LOG_MESSAGE("Failed to fix up PID 1 environment: %m"),
+        //                                 "MESSAGE_ID=" SD_MESSAGE_CORE_PID1_ENVIRONMENT_STR);
+        //                error_message = "Failed to fix up PID1 environment";
+        //                goto finish;
+        //        }
+
+        //        /* Try to figure out if we can use colors with the console. No need to do that for user
+        //         * instances since they never log into the console. */
+        //        log_show_color(colors_enabled());
+
+        //        r = make_null_stdio();
+        //        if (r < 0)
+        //                log_warning_errno(r, "Failed to redirect standard streams to /dev/null, ignoring: %m");
+
+        //        /* Load the kernel modules early. */
+        //        if (!skip_setup)
+        //                (void) kmod_setup();
+
+        //        /* Mount /proc, /sys and friends, so that /proc/cmdline and /proc/$PID/fd is available. */
+        //        r = mount_setup(loaded_policy, skip_setup);
+        //        if (r < 0) {
+        //                error_message = "Failed to mount API filesystems";
+        //                goto finish;
+        //        }
+
+        //        if (!skip_setup) {
+        //                /* Before we actually start deleting cgroup v1 code, make it harder to boot
+        //                 * in cgroupv1 mode first. See also #30852. */
+
+        //                r = mount_cgroup_legacy_controllers(loaded_policy);
+        //                if (r < 0) {
+        //                        if (r == -ERFKILL)
+        //                                error_message = "Refusing to run under cgroup v1, SYSTEMD_CGROUP_ENABLE_LEGACY_FORCE=1 not specified on kernel command line";
+        //                        else
+        //                                error_message = "Failed to mount cgroup v1 hierarchy";
+        //                        goto finish;
+        //                }
+        //                if (r > 0) {
+        //                        log_full(LOG_CRIT, "Legacy cgroup v1 support selected. This is no longer supported. Will proceed anyway after 30s.");
+        //                        (void) usleep_safe(30 * USEC_PER_SEC);
+        //                }
+        //        }
+
+        //        /* The efivarfs is now mounted, let's lock down the system token. */
+        //        lock_down_efi_variables();
+
+        //        /* Cache command-line options passed from EFI variables */
+        //        if (!skip_setup)
+        //                (void) cache_efi_options_variable();
+        //} else {
+        //        /* Running as user instance */
+        //        arg_runtime_scope = RUNTIME_SCOPE_USER;
+        //        log_set_always_reopen_console(true);
+        //        log_set_target_and_open(LOG_TARGET_AUTO);
+
+        //        /* clear the kernel timestamp, because we are not PID 1 */
+        //        kernel_timestamp = DUAL_TIMESTAMP_NULL;
+
+        //        /* Clear ambient capabilities, so services do not inherit them implicitly. Dropping them does
+        //         * not affect the permitted and effective sets which are important for the manager itself to
+        //         * operate. */
+        //        capability_ambient_set_apply(0, /* also_inherit= */ false);
+
+        //        if (mac_init() < 0) {
+        //                error_message = "Failed to initialize MAC support";
+        //                goto finish;
+        //        }
+        //}
+
+        ///* Save the original RLIMIT_NOFILE/RLIMIT_MEMLOCK so that we can reset it later when
+        // * transitioning from the initrd to the main systemd or suchlike. */
+        //save_rlimits(&saved_rlimit_nofile, &saved_rlimit_memlock);
+
+        ///* Reset all signal handlers. */
+        //(void) reset_all_signal_handlers();
+        //(void) ignore_signals(SIGNALS_IGNORE);
+
+        //(void) parse_configuration(&saved_rlimit_nofile, &saved_rlimit_memlock);
+
+        //r = parse_argv(argc, argv);
+        //if (r < 0) {
+        //        error_message = "Failed to parse command line arguments";
+        //        goto finish;
+        //}
+
+        //r = safety_checks();
+        //if (r < 0)
+        //        goto finish;
+
+        //if (IN_SET(arg_action, ACTION_TEST, ACTION_HELP, ACTION_DUMP_CONFIGURATION_ITEMS, ACTION_DUMP_BUS_PROPERTIES, ACTION_BUS_INTROSPECT))
+        //        pager_open(arg_pager_flags);
+
+        //if (arg_action != ACTION_RUN)
+        //        skip_setup = true;
+
+        //if (arg_action == ACTION_HELP) {
+        //        retval = help() < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        //        goto finish;
+        //} else if (arg_action == ACTION_VERSION) {
+        //        retval = version();
+        //        goto finish;
+        //} else if (arg_action == ACTION_DUMP_CONFIGURATION_ITEMS) {
+        //        unit_dump_config_items(stdout);
+        //        retval = EXIT_SUCCESS;
+        //        goto finish;
+        //} else if (arg_action == ACTION_DUMP_BUS_PROPERTIES) {
+        //        dump_bus_properties(stdout);
+        //        retval = EXIT_SUCCESS;
+        //        goto finish;
+        //} else if (arg_action == ACTION_BUS_INTROSPECT) {
+        //        r = bus_manager_introspect_implementations(stdout, arg_bus_introspect);
+        //        retval = r >= 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+        //        goto finish;
+        //}
+
+        //assert_se(IN_SET(arg_action, ACTION_RUN, ACTION_TEST));
+
+        ///* Move out of the way, so that we won't block unmounts */
+        //assert_se(chdir("/") == 0);
+
+        //if (arg_action == ACTION_RUN) {
+        //        if (!skip_setup) {
+        //                /* Apply the systemd.clock_usec= kernel command line switch */
+        //                apply_clock_update();
+
+        //                /* Apply random seed from kernel command line */
+        //                cmdline_take_random_seed();
+        //        }
+
+        //        /* A core pattern might have been specified via the cmdline. */
+        //        initialize_core_pattern(skip_setup);
+
+        //        /* Make /usr/ read-only */
+        //        apply_protect_system(skip_setup);
+
+        //        /* Close logging fds, in order not to confuse collecting passed fds and terminal logic below */
+        //        log_close();
+
+        //        /* Remember open file descriptors for later deserialization */
+        //        r = collect_fds(&fds, &error_message);
+        //        if (r < 0)
+        //                goto finish;
+
+        //        /* Give up any control of the console, but make sure its initialized. */
+        //        setup_console_terminal(skip_setup);
+
+        //        /* Open the logging devices, if possible and necessary */
+        //        log_open();
+        //}
+
+        //log_execution_mode(&first_boot);
+
+        //r = initialize_runtime(skip_setup,
+        //                       first_boot,
+        //                       &saved_rlimit_nofile,
+        //                       &saved_rlimit_memlock,
+        //                       &error_message);
+        //if (r < 0)
+        //        goto finish;
+
+        //r = manager_new(arg_runtime_scope,
+        //                arg_action == ACTION_TEST ? MANAGER_TEST_FULL : 0,
+        //                &m);
+        //if (r < 0) {
+        //        log_struct_errno(LOG_EMERG, r,
+        //                         LOG_MESSAGE("Failed to allocate manager object: %m"),
+        //                         "MESSAGE_ID=" SD_MESSAGE_CORE_MANAGER_ALLOCATE_STR);
+        //        error_message = "Failed to allocate manager object";
+        //        goto finish;
+        //}
+
+        //m->timestamps[MANAGER_TIMESTAMP_KERNEL] = kernel_timestamp;
+        //m->timestamps[MANAGER_TIMESTAMP_INITRD] = initrd_timestamp;
+        //m->timestamps[MANAGER_TIMESTAMP_USERSPACE] = userspace_timestamp;
+        //m->timestamps[manager_timestamp_initrd_mangle(MANAGER_TIMESTAMP_SECURITY_START)] = security_start_timestamp;
+        //m->timestamps[manager_timestamp_initrd_mangle(MANAGER_TIMESTAMP_SECURITY_FINISH)] = security_finish_timestamp;
+
+        //set_manager_defaults(m);
+        //set_manager_settings(m);
+        //manager_set_first_boot(m, first_boot);
+        //manager_set_switching_root(m, arg_switched_root);
+
+        ///* Remember whether we should queue the default job */
+        //queue_default_job = !arg_serialization || arg_switched_root;
+
+        //before_startup = now(CLOCK_MONOTONIC);
+
+        //r = manager_startup(m, arg_serialization, fds, /* root= */ NULL);
+        //if (r < 0) {
+        //        error_message = "Failed to start up manager";
+        //        goto finish;
+        //}
+
+        ///* This will close all file descriptors that were opened, but not claimed by any unit. */
+        //fds = fdset_free(fds);
+        //arg_serialization = safe_fclose(arg_serialization);
+
+        //if (queue_default_job) {
+        //        r = do_queue_default_job(m, &error_message);
+        //        if (r < 0)
+        //                goto finish;
+        //}
+
+        //after_startup = now(CLOCK_MONOTONIC);
+
+        //log_full(arg_action == ACTION_TEST ? LOG_INFO : LOG_DEBUG,
+        //         "Loaded units and determined initial transaction in %s.",
+        //         FORMAT_TIMESPAN(after_startup - before_startup, 100 * USEC_PER_MSEC));
+
+        //if (arg_action == ACTION_TEST) {
+        //        manager_test_summary(m);
+        //        retval = EXIT_SUCCESS;
+        //        goto finish;
+        //}
+
+        //r = invoke_main_loop(m,
+        //                     &saved_rlimit_nofile,
+        //                     &saved_rlimit_memlock,
+        //                     &retval,
+        //                     &fds,
+        //                     &switch_root_dir,
+        //                     &switch_root_init,
+        //                     &error_message);
+        //assert(r < 0 || IN_SET(r, MANAGER_EXIT,          /* MANAGER_OK is not expected here. */
+        //                          MANAGER_RELOAD,
+        //                          MANAGER_REEXECUTE,
+        //                          MANAGER_REBOOT,
+        //                          MANAGER_SOFT_REBOOT,
+        //                          MANAGER_POWEROFF,
+        //                          MANAGER_HALT,
+        //                          MANAGER_KEXEC,
+        //                          MANAGER_SWITCH_ROOT));
 
 finish:
-        pager_close();
+        //pager_close();
 
-        if (m) {
-                arg_reboot_watchdog = manager_get_watchdog(m, WATCHDOG_REBOOT);
-                arg_kexec_watchdog = manager_get_watchdog(m, WATCHDOG_KEXEC);
-                m = manager_free(m);
-        }
+        //if (m) {
+        //        arg_reboot_watchdog = manager_get_watchdog(m, WATCHDOG_REBOOT);
+        //        arg_kexec_watchdog = manager_get_watchdog(m, WATCHDOG_KEXEC);
+        //        m = manager_free(m);
+        //}
 
-        mac_selinux_finish();
+        //mac_selinux_finish();
 
-        if (IN_SET(r, MANAGER_REEXECUTE, MANAGER_SWITCH_ROOT, MANAGER_SOFT_REBOOT))
-                r = do_reexecute(r,
-                                 argc, argv,
-                                 &saved_rlimit_nofile,
-                                 &saved_rlimit_memlock,
-                                 fds,
-                                 switch_root_dir,
-                                 switch_root_init,
-                                 &error_message); /* This only returns if reexecution failed */
+        //if (IN_SET(r, MANAGER_REEXECUTE, MANAGER_SWITCH_ROOT, MANAGER_SOFT_REBOOT))
+        //        r = do_reexecute(r,
+        //                         argc, argv,
+        //                         &saved_rlimit_nofile,
+        //                         &saved_rlimit_memlock,
+        //                         fds,
+        //                         switch_root_dir,
+        //                         switch_root_init,
+        //                         &error_message); /* This only returns if reexecution failed */
 
-        arg_serialization = safe_fclose(arg_serialization);
-        fds = fdset_free(fds);
+        //arg_serialization = safe_fclose(arg_serialization);
+        //fds = fdset_free(fds);
 
-        saved_env = strv_free(saved_env);
+        //saved_env = strv_free(saved_env);
 
-#if HAVE_VALGRIND_VALGRIND_H
-        /* If we are PID 1 and running under valgrind, then let's exit
-         * here explicitly. valgrind will only generate nice output on
-         * exit(), not on exec(), hence let's do the former not the
-         * latter here. */
-        if (getpid_cached() == 1 && RUNNING_ON_VALGRIND) {
-                /* Cleanup watchdog_device strings for valgrind. We need them
-                 * in become_shutdown() so normally we cannot free them yet. */
-                watchdog_free_device();
-                reset_arguments();
-                return retval;
-        }
+#if HAVE//_VALGRIND_VALGRIND_H
+        ///* If we are PID 1 and running under valgrind, then let's exit
+        // * here explicitly. valgrind will only generate nice output on
+        // * exit(), not on exec(), hence let's do the former not the
+        // * latter here. */
+        //if (getpid_cached() == 1 && RUNNING_ON_VALGRIND) {
+        //        /* Cleanup watchdog_device strings for valgrind. We need them
+        //         * in become_shutdown() so normally we cannot free them yet. */
+        //        watchdog_free_device();
+        //        reset_arguments();
+        //        return retval;
+        //}
 #endif
 
-#if HAS_FEATURE_ADDRESS_SANITIZER
-        /* At this stage we most likely don't have stdio/stderr open, so the following
-         * LSan check would not print any actionable information and would just crash
-         * PID 1. To make this a bit more helpful, let's try to open /dev/console,
-         * and if we succeed redirect LSan's report there. */
-        if (getpid_cached() == 1) {
-                _cleanup_close_ int tty_fd = -EBADF;
+#if HAS_//FEATURE_ADDRESS_SANITIZER
+        ///* At this stage we most likely don't have stdio/stderr open, so the following
+        // * LSan check would not print any actionable information and would just crash
+        // * PID 1. To make this a bit more helpful, let's try to open /dev/console,
+        // * and if we succeed redirect LSan's report there. */
+        //if (getpid_cached() == 1) {
+        //        _cleanup_close_ int tty_fd = -EBADF;
 
-                tty_fd = open_terminal("/dev/console", O_WRONLY|O_NOCTTY|O_CLOEXEC);
-                if (tty_fd >= 0)
-                        __sanitizer_set_report_fd((void*) (intptr_t) tty_fd);
+        //        tty_fd = open_terminal("/dev/console", O_WRONLY|O_NOCTTY|O_CLOEXEC);
+        //        if (tty_fd >= 0)
+        //                __sanitizer_set_report_fd((void*) (intptr_t) tty_fd);
 
-                __lsan_do_leak_check();
-        }
+        //        __lsan_do_leak_check();
+        //}
 #endif
 
-        if (r < 0)
-                (void) sd_notifyf(/* unset_environment= */ false,
-                                  "ERRNO=%i", -r);
+        //if (r < 0)
+        //        (void) sd_notifyf(/* unset_environment= */ false,
+        //                          "ERRNO=%i", -r);
 
-        /* Try to invoke the shutdown binary unless we already failed.
-         * If we failed above, we want to freeze after finishing cleanup. */
-        if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM &&
-            IN_SET(r, MANAGER_EXIT, MANAGER_REBOOT, MANAGER_POWEROFF, MANAGER_HALT, MANAGER_KEXEC)) {
-                r = become_shutdown(r, retval);
-                log_error_errno(r, "Failed to execute shutdown binary, %s: %m", getpid_cached() == 1 ? "freezing" : "quitting");
-                error_message = "Failed to execute shutdown binary";
-        }
+        ///* Try to invoke the shutdown binary unless we already failed.
+        // * If we failed above, we want to freeze after finishing cleanup. */
+        //if (arg_runtime_scope == RUNTIME_SCOPE_SYSTEM &&
+        //    IN_SET(r, MANAGER_EXIT, MANAGER_REBOOT, MANAGER_POWEROFF, MANAGER_HALT, MANAGER_KEXEC)) {
+        //        r = become_shutdown(r, retval);
+        //        log_error_errno(r, "Failed to execute shutdown binary, %s: %m", getpid_cached() == 1 ? "freezing" : "quitting");
+        //        error_message = "Failed to execute shutdown binary";
+        //}
 
-        /* This is primarily useful when running systemd in a VM, as it provides the user running the VM with
-         * a mechanism to pick up systemd's exit status in the VM. */
-        (void) sd_notifyf(/* unset_environment= */ false,
-                          "EXIT_STATUS=%i", retval);
+        ///* This is primarily useful when running systemd in a VM, as it provides the user running the VM with
+        // * a mechanism to pick up systemd's exit status in the VM. */
+        //(void) sd_notifyf(/* unset_environment= */ false,
+        //                  "EXIT_STATUS=%i", retval);
 
-        watchdog_free_device();
-        arg_watchdog_device = mfree(arg_watchdog_device);
+        //watchdog_free_device();
+        //arg_watchdog_device = mfree(arg_watchdog_device);
 
-        if (getpid_cached() == 1) {
-                if (error_message)
-                        manager_status_printf(NULL, STATUS_TYPE_EMERGENCY,
-                                              ANSI_HIGHLIGHT_RED "!!!!!!" ANSI_NORMAL,
-                                              "%s.", error_message);
-                freeze_or_exit_or_reboot();
-        }
+        //if (getpid_cached() == 1) {
+        //        if (error_message)
+        //                manager_status_printf(NULL, STATUS_TYPE_EMERGENCY,
+        //                                      ANSI_HIGHLIGHT_RED "!!!!!!" ANSI_NORMAL,
+        //                                      "%s.", error_message);
+        //        freeze_or_exit_or_reboot();
+        //}
 
-        reset_arguments();
-        return retval;
+        //reset_arguments();
+        //return retval;
 }
